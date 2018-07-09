@@ -38,17 +38,20 @@ def findModules(path):
 
 def main():
     # Find Uranium via the PYTHONPATH var
-    uraniumUMPath = where("UM", os.getenv("PYTHONPATH"))
-    if uraniumUMPath is None:
-        uraniumUMPath = os.path.join("..", "Uranium")
-    uraniumPath = os.path.dirname(uraniumUMPath)
+    uranium_path = where("UM", os.getenv("PYTHONPATH"))
+    print(" - Uranium path: %s" % uranium_path)
+    if not uranium_path:
+        uranium_path = os.path.abspath(os.path.join("..", "Uranium"))
+        os.environ["PYTHONPATH"] = os.pathsep.join([uranium_path, os.environ.get("PYTHONPATH", ""), "."])
+    else:
+        uranium_path = os.path.dirname(uranium_path)
+    print(" - Uranium path: %s" % uranium_path)
+
+    print("PYTHONPATH = %s" % os.getenv("PYTHONPATH"))
 
     mypy_path_parts = [".", os.path.join(".", "plugins"), os.path.join(".", "plugins", "VersionUpgrade"),
-                       uraniumPath, os.path.join(uraniumPath, "stubs")]
-    if sys.platform == "win32":
-        os.putenv("MYPYPATH", ";".join(mypy_path_parts))
-    else:
-        os.putenv("MYPYPATH", ":".join(mypy_path_parts))
+                       uranium_path, os.path.join(uranium_path, "stubs")]
+    os.putenv("MYPYPATH", os.pathsep.join(mypy_path_parts))
 
     # Mypy really needs to be run via its Python script otherwise it can't find its data files.
     mypy_exe_name = "mypy.exe" if sys.platform == "win32" else "mypy"

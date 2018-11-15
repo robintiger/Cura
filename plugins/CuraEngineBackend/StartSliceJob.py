@@ -5,7 +5,7 @@ import numpy
 from string import Formatter
 from enum import IntEnum
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, cast, Dict, List, Optional, Set
 import re
 import Arcus #For typing.
 
@@ -41,11 +41,15 @@ class StartJobResult(IntEnum):
 
 ##  Formatter class that handles token expansion in start/end gcode
 class GcodeStartEndFormatter(Formatter):
-    def get_value(self, key: str, *args: str, default_extruder_nr: str = "-1", **kwargs) -> str: #type: ignore # [CodeStyle: get_value is an overridden function from the Formatter class]
+    def __init__(self, default_extruder_nr: int = -1) -> None:
+        super().__init__()
+        self._default_extruder_nr = default_extruder_nr
+
+    def get_value(self, key: str, args: str, kwargs: dict) -> str: #type: ignore # [CodeStyle: get_value is an overridden function from the Formatter class]
         # The kwargs dictionary contains a dictionary for each stack (with a string of the extruder_nr as their key),
         # and a default_extruder_nr to use when no extruder_nr is specified
 
-        extruder_nr = int(default_extruder_nr)
+        extruder_nr = self._default_extruder_nr
 
         key_fragments = [fragment.strip() for fragment in key.split(",")]
         if len(key_fragments) == 2:
@@ -209,16 +213,21 @@ class StartSliceJob(Job):
                 if temp_list:
                     object_groups.append(temp_list)
 
-            extruders_enabled = {position: stack.isEnabled for position, stack in CuraApplication.getInstance().getGlobalContainerStack().extruders.items()}
+            global_stack = CuraApplication.getInstance().getGlobalContainerStack()
+            if not global_stack:
+                return
+            extruders_enabled = {position: stack.isEnabled for position, stack in global_stack.extruders.items()}
             filtered_object_groups = []
             has_model_with_disabled_extruders = False
             associated_disabled_extruders = set()
             for group in object_groups:
-                stack = CuraApplication.getInstance().getGlobalContainerStack()
+                stack = global_stack
                 skip_group = False
                 for node in group:
+                    # Only check if the printing extruder is enabled for printing meshes
+                    is_non_printing_mesh = node.callDecoration("evaluateIsNonPrintingMesh")
                     extruder_position = node.callDecoration("getActiveExtruderPosition")
-                    if not extruders_enabled[extruder_position]:
+                    if not is_non_printing_mesh and not extruders_enabled[extruder_position]:
                         skip_group = True
                         has_model_with_disabled_extruders = True
                         associated_disabled_extruders.add(extruder_position)
@@ -242,7 +251,10 @@ class StartSliceJob(Job):
             self._buildGlobalInheritsStackMessage(stack)
 
             # Build messages for extruder stacks
-            for extruder_stack in ExtruderManager.getInstance().getMachineExtruders(stack.getId()):
+            # Send the extruder settings in the order of extruder positions. Somehow, if you send e.g. extruder 3 first,
+            # then CuraEngine can slice with the wrong settings. This I think should be fixed in CuraEngine as well.
+            extruder_stack_list = sorted(list(global_stack.extruders.items()), key = lambda item: int(item[0]))
+            for _, extruder_stack in extruder_stack_list:
                 self._buildExtruderMessage(extruder_stack)
 
             for group in filtered_object_groups:
@@ -265,7 +277,7 @@ class StartSliceJob(Job):
 
                     obj = group_message.addRepeatedMessage("objects")
                     obj.id = id(object)
-
+                    obj.name = object.getName()
                     indices = mesh_data.getIndices()
                     if indices is not None:
                         flat_verts = numpy.take(verts, indices.flatten(), axis=0)
@@ -286,6 +298,9 @@ class StartSliceJob(Job):
 
     def isCancelled(self) -> bool:
         return self._is_cancelled
+
+    def setIsCancelled(self, value: bool):
+        self._is_cancelled = value
 
     ##  Creates a dictionary of tokens to replace in g-code pieces.
     #
@@ -318,20 +333,20 @@ class StartSliceJob(Job):
     #   \param default_extruder_nr Stack nr to use when no stack nr is specified, defaults to the global stack
     def _expandGcodeTokens(self, value: str, default_extruder_nr: int = -1) -> str:
         if not self._all_extruders_settings:
-            global_stack = CuraApplication.getInstance().getGlobalContainerStack()
+            global_stack = cast(ContainerStack, CuraApplication.getInstance().getGlobalContainerStack())
 
             # NB: keys must be strings for the string formatter
             self._all_extruders_settings = {
                 "-1": self._buildReplacementTokens(global_stack)
             }
 
-            for extruder_stack in ExtruderManager.getInstance().getMachineExtruders(global_stack.getId()):
+            for extruder_stack in ExtruderManager.getInstance().getActiveExtruderStacks():
                 extruder_nr = extruder_stack.getProperty("extruder_nr", "value")
                 self._all_extruders_settings[str(extruder_nr)] = self._buildReplacementTokens(extruder_stack)
 
         try:
             # any setting can be used as a token
-            fmt = GcodeStartEndFormatter()
+            fmt = GcodeStartEndFormatter(default_extruder_nr = default_extruder_nr)
             settings = self._all_extruders_settings.copy()
             settings["default_extruder_nr"] = default_extruder_nr
             return str(fmt.format(value, **settings))
@@ -432,8 +447,7 @@ class StartSliceJob(Job):
             Job.yieldThread()
 
         # Ensure that the engine is aware what the build extruder is.
-        if stack.getProperty("machine_extruder_count", "value") > 1:
-            changed_setting_keys.add("extruder_nr")
+        changed_setting_keys.add("extruder_nr")
 
         # Get values for all changed settings
         for key in changed_setting_keys:

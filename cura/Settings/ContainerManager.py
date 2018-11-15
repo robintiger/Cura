@@ -4,11 +4,11 @@
 import os
 import urllib.parse
 import uuid
-from typing import Any
-from typing import Dict, Union, Optional
+from typing import Dict, Union, Any, TYPE_CHECKING, List
 
-from PyQt5.QtCore import QObject, QUrl, QVariant
+from PyQt5.QtCore import QObject, QUrl
 from PyQt5.QtWidgets import QMessageBox
+
 
 from UM.i18n import i18nCatalog
 from UM.FlameProfiler import pyqtSlot
@@ -21,6 +21,18 @@ from UM.Settings.ContainerStack import ContainerStack
 from UM.Settings.DefinitionContainer import DefinitionContainer
 from UM.Settings.InstanceContainer import InstanceContainer
 
+
+if TYPE_CHECKING:
+    from cura.CuraApplication import CuraApplication
+    from cura.Machines.ContainerNode import ContainerNode
+    from cura.Machines.MaterialNode import MaterialNode
+    from cura.Machines.QualityChangesGroup import QualityChangesGroup
+    from UM.PluginRegistry import PluginRegistry
+    from cura.Settings.MachineManager import MachineManager
+    from cura.Machines.MaterialManager import MaterialManager
+    from cura.Machines.QualityManager import QualityManager
+    from cura.Settings.CuraContainerRegistry import CuraContainerRegistry
+
 catalog = i18nCatalog("cura")
 
 
@@ -31,34 +43,36 @@ catalog = i18nCatalog("cura")
 #   when a certain action happens. This can be done through this class.
 class ContainerManager(QObject):
 
-    def __init__(self, application):
+    def __init__(self, application: "CuraApplication") -> None:
         if ContainerManager.__instance is not None:
             raise RuntimeError("Try to create singleton '%s' more than once" % self.__class__.__name__)
         ContainerManager.__instance = self
 
         super().__init__(parent = application)
 
-        self._application = application
-        self._plugin_registry = self._application.getPluginRegistry()
-        self._container_registry = self._application.getContainerRegistry()
-        self._machine_manager = self._application.getMachineManager()
-        self._material_manager = self._application.getMaterialManager()
-        self._quality_manager = self._application.getQualityManager()
-        self._container_name_filters = {}   # type: Dict[str, Dict[str, Any]]
+        self._application = application # type: CuraApplication
+        self._plugin_registry = self._application.getPluginRegistry()  # type: PluginRegistry
+        self._container_registry = self._application.getContainerRegistry()  # type: CuraContainerRegistry
+        self._machine_manager = self._application.getMachineManager()  # type: MachineManager
+        self._material_manager = self._application.getMaterialManager()  # type: MaterialManager
+        self._quality_manager = self._application.getQualityManager()  # type: QualityManager
+        self._container_name_filters = {}  # type: Dict[str, Dict[str, Any]]
 
-    @pyqtSlot(str, str, str, result=str)
-    def getContainerMetaDataEntry(self, container_id, entry_name, sub_entry: Optional[str] = None):
+    @pyqtSlot(str, str, result=str)
+    def getContainerMetaDataEntry(self, container_id: str, entry_names: str) -> str:
         metadatas = self._container_registry.findContainersMetadata(id = container_id)
         if not metadatas:
             Logger.log("w", "Could not get metadata of container %s because it was not found.", container_id)
             return ""
 
-        sub_data = metadatas[0].get(entry_name, "")
-        result = str(sub_data)
-        if sub_entry:
-            result = str(sub_data.get(sub_entry, ""))
-
-        return result
+        entries = entry_names.split("/")
+        result = metadatas[0]
+        while entries:
+            entry = entries.pop(0)
+            result = result.get(entry, {})
+        if not result:
+            return ""
+        return str(result)
 
     ##  Set a metadata entry of the specified container.
     #
@@ -67,20 +81,23 @@ class ContainerManager(QObject):
     #   by using "/" as a separator. For example, to change an entry "foo" in a
     #   dictionary entry "bar", you can specify "bar/foo" as entry name.
     #
-    #   \param container_id \type{str} The ID of the container to change.
+    #   \param container_node \type{ContainerNode}
     #   \param entry_name \type{str} The name of the metadata entry to change.
     #   \param entry_value The new value of the entry.
     #
-    #   \return True if successful, False if not.
     #  TODO: This is ONLY used by MaterialView for material containers. Maybe refactor this.
+    #  Update: In order for QML to use objects and sub objects, those (sub) objects must all be QObject. Is that what we want?
     @pyqtSlot("QVariant", str, str)
-    def setContainerMetaDataEntry(self, container_node, entry_name, entry_value):
-        root_material_id = container_node.metadata["base_file"]
+    def setContainerMetaDataEntry(self, container_node: "ContainerNode", entry_name: str, entry_value: str) -> bool:
+        root_material_id = container_node.getMetaDataEntry("base_file", "")
         if self._container_registry.isReadOnly(root_material_id):
             Logger.log("w", "Cannot set metadata of read-only container %s.", root_material_id)
             return False
 
         material_group = self._material_manager.getMaterialGroup(root_material_id)
+        if material_group is None:
+            Logger.log("w", "Unable to find material group for: %s.", root_material_id)
+            return False
 
         entries = entry_name.split("/")
         entry_name = entries.pop()
@@ -88,11 +105,11 @@ class ContainerManager(QObject):
         sub_item_changed = False
         if entries:
             root_name = entries.pop(0)
-            root = material_group.root_material_node.metadata.get(root_name)
+            root = material_group.root_material_node.getMetaDataEntry(root_name)
 
             item = root
             for _ in range(len(entries)):
-                item = item.get(entries.pop(0), { })
+                item = item.get(entries.pop(0), {})
 
             if item[entry_name] != entry_value:
                 sub_item_changed = True
@@ -106,66 +123,10 @@ class ContainerManager(QObject):
             container.setMetaDataEntry(entry_name, entry_value)
             if sub_item_changed: #If it was only a sub-item that has changed then the setMetaDataEntry won't correctly notice that something changed, and we must manually signal that the metadata changed.
                 container.metaDataChanged.emit(container)
-
-    ##  Set a setting property of the specified container.
-    #
-    #   This will set the specified property of the specified setting of the container
-    #   and all containers that share the same base_file (if any). The latter only
-    #   happens for material containers.
-    #
-    #   \param container_id \type{str} The ID of the container to change.
-    #   \param setting_key \type{str} The key of the setting.
-    #   \param property_name \type{str} The name of the property, eg "value".
-    #   \param property_value \type{str} The new value of the property.
-    #
-    #   \return True if successful, False if not.
-    @pyqtSlot(str, str, str, str, result = bool)
-    def setContainerProperty(self, container_id, setting_key, property_name, property_value):
-        if self._container_registry.isReadOnly(container_id):
-            Logger.log("w", "Cannot set properties of read-only container %s.", container_id)
-            return False
-
-        containers = self._container_registry.findContainers(id = container_id)
-        if not containers:
-            Logger.log("w", "Could not set properties of container %s because it was not found.", container_id)
-            return False
-
-        container = containers[0]
-
-        container.setProperty(setting_key, property_name, property_value)
-
-        basefile = container.getMetaDataEntry("base_file", container_id)
-        for sibbling_container in self._container_registry.findInstanceContainers(base_file = basefile):
-            if sibbling_container != container:
-                sibbling_container.setProperty(setting_key, property_name, property_value)
-
         return True
 
-    ##  Get a setting property of the specified container.
-    #
-    #   This will get the specified property of the specified setting of the
-    #   specified container.
-    #
-    #   \param container_id The ID of the container to get the setting property
-    #   of.
-    #   \param setting_key The key of the setting to get the property of.
-    #   \param property_name The property to obtain.
-    #   \return The value of the specified property. The type of this property
-    #   value depends on the type of the property. For instance, the "value"
-    #   property of an integer setting will be a Python int, but the "value"
-    #   property of an enum setting will be a Python str.
-    @pyqtSlot(str, str, str, result = QVariant)
-    def getContainerProperty(self, container_id: str, setting_key: str, property_name: str):
-        containers = self._container_registry.findContainers(id = container_id)
-        if not containers:
-            Logger.log("w", "Could not get properties of container %s because it was not found.", container_id)
-            return ""
-        container = containers[0]
-
-        return container.getProperty(setting_key, property_name)
-
     @pyqtSlot(str, result = str)
-    def makeUniqueName(self, original_name):
+    def makeUniqueName(self, original_name: str) -> str:
         return self._container_registry.uniqueName(original_name)
 
     ##  Get a list of string that can be used as name filters for a Qt File Dialog
@@ -179,7 +140,7 @@ class ContainerManager(QObject):
     #
     #   \return A string list with name filters.
     @pyqtSlot(str, result = "QStringList")
-    def getContainerNameFilters(self, type_name):
+    def getContainerNameFilters(self, type_name: str) -> List[str]:
         if not self._container_name_filters:
             self._updateContainerNameFilters()
 
@@ -311,7 +272,7 @@ class ContainerManager(QObject):
     #
     #   \return \type{bool} True if successful, False if not.
     @pyqtSlot(result = bool)
-    def updateQualityChanges(self):
+    def updateQualityChanges(self) -> bool:
         global_stack = self._machine_manager.activeMachine
         if not global_stack:
             return False
@@ -367,10 +328,10 @@ class ContainerManager(QObject):
     #   \param material_id \type{str} the id of the material for which to get the linked materials.
     #   \return \type{list} a list of names of materials with the same GUID
     @pyqtSlot("QVariant", bool, result = "QStringList")
-    def getLinkedMaterials(self, material_node, exclude_self = False):
-        guid = material_node.metadata["GUID"]
+    def getLinkedMaterials(self, material_node: "MaterialNode", exclude_self: bool = False):
+        guid = material_node.getMetaDataEntry("GUID", "")
 
-        self_root_material_id = material_node.metadata["base_file"]
+        self_root_material_id = material_node.getMetaDataEntry("base_file")
         material_group_list = self._material_manager.getMaterialGroupListByGUID(guid)
 
         linked_material_names = []
@@ -378,15 +339,19 @@ class ContainerManager(QObject):
             for material_group in material_group_list:
                 if exclude_self and material_group.name == self_root_material_id:
                     continue
-                linked_material_names.append(material_group.root_material_node.metadata["name"])
+                linked_material_names.append(material_group.root_material_node.getMetaDataEntry("name", ""))
         return linked_material_names
 
     ##  Unlink a material from all other materials by creating a new GUID
     #   \param material_id \type{str} the id of the material to create a new GUID for.
     @pyqtSlot("QVariant")
-    def unlinkMaterial(self, material_node):
+    def unlinkMaterial(self, material_node: "MaterialNode") -> None:
         # Get the material group
-        material_group = self._material_manager.getMaterialGroup(material_node.metadata["base_file"])
+        material_group = self._material_manager.getMaterialGroup(material_node.getMetaDataEntry("base_file", ""))
+
+        if material_group is None:
+            Logger.log("w", "Unable to find material group for %s", material_node)
+            return
 
         # Generate a new GUID
         new_guid = str(uuid.uuid4())
@@ -398,7 +363,7 @@ class ContainerManager(QObject):
         if container is not None:
             container.setMetaDataEntry("GUID", new_guid)
 
-    def _performMerge(self, merge_into, merge, clear_settings = True):
+    def _performMerge(self, merge_into: InstanceContainer, merge: InstanceContainer, clear_settings: bool = True) -> None:
         if merge == merge_into:
             return
 
@@ -426,7 +391,8 @@ class ContainerManager(QObject):
                 continue
 
             mime_type = self._container_registry.getMimeTypeForContainer(container_type)
-
+            if mime_type is None:
+                continue
             entry = {
                 "type": serialize_type,
                 "mime": mime_type,
@@ -454,7 +420,7 @@ class ContainerManager(QObject):
 
     ##  Import single profile, file_url does not have to end with curaprofile
     @pyqtSlot(QUrl, result="QVariantMap")
-    def importProfile(self, file_url):
+    def importProfile(self, file_url: QUrl):
         if not file_url.isValid():
             return
         path = file_url.toLocalFile()
@@ -463,7 +429,7 @@ class ContainerManager(QObject):
         return self._container_registry.importProfile(path)
 
     @pyqtSlot(QObject, QUrl, str)
-    def exportQualityChangesGroup(self, quality_changes_group, file_url: QUrl, file_type: str):
+    def exportQualityChangesGroup(self, quality_changes_group: "QualityChangesGroup", file_url: QUrl, file_type: str) -> None:
         if not file_url.isValid():
             return
         path = file_url.toLocalFile()
